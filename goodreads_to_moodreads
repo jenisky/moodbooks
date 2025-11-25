@@ -30,9 +30,16 @@ DATABASE_ID = "5813a47dec1d4ae3ab2711433538ce4f"
 OPENAI_SLEEP_SECONDS = 0.7
 NOTION_SLEEP_SECONDS = 0.3
 
+# LLM configuration
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
 # ==============================
 #  Helpers
 # ==============================
+
+def validate_url(value: str) -> bool:
+    return isinstance(value, str) and value.startswith(("http://", "https://"))
+
 
 def get_env_or_prompt(name: str, prompt_text: str) -> str:
     val = os.getenv(name)
@@ -46,9 +53,17 @@ def load_valid_tag_lists(path: str = "mood_reads_fields.csv") -> dict:
     Load allowed tags for Mood/Tone/etc from the CSV we generated.
     Assumes a single row, semicolon-separated values.
     """
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Tag list CSV not found at '{path}'. Ensure mood_reads_fields.csv is available."
+        )
+
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        row = next(reader)
+        try:
+            row = next(reader)
+        except StopIteration:
+            raise ValueError(f"Tag list CSV '{path}' is empty.")
 
     def split(val: str):
         if not val:
@@ -183,15 +198,25 @@ Description / user review text:
         "Content-Type": "application/json",
     }
     body = {
-        "model": "gpt-4.1-mini",  # or "gpt-4o-mini" depending on what you’re using
+        "model": OPENAI_MODEL,
         "messages": [
             {"role": "system", "content": "You are a precise JSON-only book metadata generator."},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.4,
+        "max_tokens": 2500,
+        "response_format": {"type": "json_object"},
     }
 
-    res = requests.post(url, headers=headers, json=body)
+    try:
+        if not validate_url(url):
+            print("   ❌ Invalid OpenAI endpoint URL.")
+            return None
+        res = requests.post(url, headers=headers, json=body, timeout=60)
+    except requests.RequestException as exc:
+        print(f"   ❌ OpenAI request failed: {exc}")
+        return None
+
     if res.status_code != 200:
         print(f"   ❌ OpenAI error {res.status_code}")
         try:
@@ -201,7 +226,14 @@ Description / user review text:
         return None
 
     try:
-        content = res.json()["choices"][0]["message"]["content"].strip()
+        res_json = res.json()
+    except ValueError as exc:
+        print("   ❌ OpenAI response was not valid JSON:", exc)
+        return None
+
+    try:
+        message = res_json.get("choices", [{}])[0].get("message", {})
+        content = (message.get("content") or "").strip()
         if content.startswith("```"):
             content = content.strip("`")
             content = content.replace("json\n", "").replace("json\r\n", "")
@@ -210,7 +242,7 @@ Description / user review text:
     except Exception as e:
         print("   ❌ Failed to parse OpenAI JSON:", e)
         try:
-            print("   Raw:", res.text[:500])
+            print("   Raw:", str(res_json)[:500])
         except Exception:
             pass
         return None
@@ -371,7 +403,16 @@ def create_notion_page(notion_token: str, properties: dict) -> bool:
         "parent": {"database_id": DATABASE_ID},
         "properties": properties,
     }
-    res = requests.post(url, headers=headers, json=payload)
+    if not validate_url(url):
+        print("   ❌ Invalid Notion endpoint URL.")
+        return False
+
+    try:
+        res = requests.post(url, headers=headers, json=payload, timeout=60)
+    except requests.RequestException as exc:
+        print(f"   ❌ Notion request failed: {exc}")
+        return False
+
     if res.status_code != 200:
         print(f"   ❌ Notion error {res.status_code}")
         try:
@@ -402,6 +443,7 @@ def main():
 
     print("📚 Loading allowed tag lists from mood_reads_fields.csv...")
     tag_lists = load_valid_tag_lists()
+    print(f"🤖 Using OpenAI model: {OPENAI_MODEL}")
 
     print(f"📥 Reading Goodreads export: {goodreads_csv_path}")
     with open(goodreads_csv_path, newline="", encoding="utf-8") as f:
